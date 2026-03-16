@@ -38,6 +38,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils.noise import GaussianNoiseCfg
+import numpy as np  # 必须加这行！让 Python 认识 "np"
 
 # ── PPO模块 ───────────────────────────────────────────────────────────────────
 from ppo_x2 import ActorCriticX2, X2PPO, X2OnPolicyRunner
@@ -45,6 +46,19 @@ from ppo_x2 import ActorCriticX2, X2PPO, X2OnPolicyRunner
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 关节定义 ──────────────────────────────────────────────────────────────────
+# 1. 腰部关节（URDF里真实存在的）
+WAIST_JOINTS = [
+    "waist_yaw_joint", "waist_pitch_joint", "waist_roll_joint"
+]
+
+# 2. 手臂关节（URDF里真实存在的）
+ARM_JOINTS = [
+    "left_shoulder_pitch_joint", "right_shoulder_pitch_joint",
+    "left_shoulder_roll_joint", "right_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "right_shoulder_yaw_joint",
+    "left_elbow_joint", "right_elbow_joint"
+]
+
 LEG_JOINTS = [
     "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
     "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
@@ -52,16 +66,20 @@ LEG_JOINTS = [
     "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
 ]
 
-# ── 观测维度 ──────────────────────────────────────────────────────────────────
-# 单帧: ang_vel(3) + proj_gravity(3) + cmd(3) + joint_pos(12) + joint_vel(12) + last_action(12) = 45
-NUM_SINGLE_OBS = 45
-FRAME_STACK = 10          # 历史帧数
-NUM_OBS = NUM_SINGLE_OBS * FRAME_STACK       # actor观测 = 450
-NUM_SHORT_OBS = NUM_SINGLE_OBS * 2           # 短历史用于状态估计 = 90
+# 3. 合并：腿部 + 腰部 + 手臂（如果想控制上半身，就用这个列表）
+ALL_JOINTS = LEG_JOINTS + WAIST_JOINTS + ARM_JOINTS
 
-# Critic特权观测单帧: lin_vel(3)+ang_vel(3)+proj_gravity(3)+cmd(3)+joint_pos(12)+joint_vel(12)+actions(12) = 48
-NUM_PRIVILEGED_OBS = 48
-NUM_ACTIONS = 12
+# ── 观测维度 ──────────────────────────────────────────────────────────────────
+NUM_JOINTS = len(ALL_JOINTS)  # 23
+# 单帧: ang_vel(3) + proj_gravity(3) + cmd(3) + joint_pos(23) + joint_vel(23) + last_action(23) = 78
+NUM_SINGLE_OBS = 78
+FRAME_STACK = 10
+NUM_OBS = NUM_SINGLE_OBS * FRAME_STACK       # 780
+NUM_SHORT_OBS = NUM_SINGLE_OBS * 2           # 156
+
+# Critic特权观测单帧: lin_vel(3)+ang_vel(3)+proj_gravity(3)+cmd(3)+joint_pos(23)+joint_vel(23)+actions(23) = 81
+NUM_PRIVILEGED_OBS = 81
+NUM_ACTIONS = NUM_JOINTS  # 23
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -81,16 +99,16 @@ class ObservationsCfg:
         projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=GaussianNoiseCfg(std=0.02))
         # 速度命令
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-        # 关节状态（只取腿部12关节）
+        # 关节状态（全身23关节）
         joint_pos       = ObsTerm(
             func=mdp.joint_pos_rel,
             noise=GaussianNoiseCfg(std=0.01),
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS)},
         )
         joint_vel       = ObsTerm(
             func=mdp.joint_vel_rel,
             noise=GaussianNoiseCfg(std=1.5),
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS)},
         )
         # 上一步动作
         actions         = ObsTerm(func=mdp.last_action)
@@ -104,14 +122,14 @@ class ObservationsCfg:
         base_ang_vel    = ObsTerm(func=mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-        # 关节状态（只取腿部12关节）
+        # 关节状态（全身23关节）
         joint_pos       = ObsTerm(
             func=mdp.joint_pos_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS)},
         )
         joint_vel       = ObsTerm(
             func=mdp.joint_vel_rel,
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=LEG_JOINTS)},
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=ALL_JOINTS)},
         )
         actions         = ObsTerm(func=mdp.last_action)
 
@@ -123,7 +141,7 @@ class ObservationsCfg:
 class ActionsCfg:
     joint_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
-        joint_names=LEG_JOINTS,
+        joint_names=ALL_JOINTS,
         scale=0.5,
         use_default_offset=True,
     )
@@ -150,7 +168,7 @@ class RewardsCfg:
     )
 
     # ── 惩罚 ──────────────────────────────────────────────────────────────────
-    terminating     = RewTerm(func=mdp.is_terminated,              weight=-200.0)
+    terminating     = RewTerm(func=mdp.is_terminated,              weight=-50.0)  # 降低终止惩罚
     lin_vel_z       = RewTerm(func=mdp.lin_vel_z_l2,               weight=-2.0)
     ang_vel_xy      = RewTerm(func=mdp.ang_vel_xy_l2,              weight=-0.05)
     flat_orientation = RewTerm(func=mdp.flat_orientation_l2,       weight=-5.0)
@@ -175,7 +193,11 @@ class RewardsCfg:
         params={
             "threshold": 1.0,
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"])
-        }
+        }    
+    )
+    tilt_penalty = RewTerm(
+        func=mdp.flat_orientation_l2,
+        weight=-0.5,
     )
 
 
@@ -185,15 +207,15 @@ class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        rel_standing_envs=0.5,  # 50%环境只需站立
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.5,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0),
-            lin_vel_y=(-1.0, 1.0),
-            ang_vel_z=(-1.0, 1.0),
+            lin_vel_x=(-0.1, 0.1),  # 先从小速度开始
+            lin_vel_y=(-0.1, 0.1),
+            ang_vel_z=(-0.2, 0.2),
             heading=(-3.14, 3.14),
         ),
     )
@@ -207,12 +229,12 @@ class TerminationsCfg:
         params={"sensor_cfg": SceneEntityCfg(
             "contact_forces",
             body_names=["pelvis", "torso_link"]),
-            "threshold": 1.0},
+            "threshold": 150.0},  # 提高阈值，避免轻微接触就终止
     )
-    # 倾斜过大则终止
+    # 倾斜过大则终止（放宽到45度）
     bad_orientation = DoneTerm(
         func=mdp.bad_orientation,
-        params={"limit_angle": 1.0},
+        params={"limit_angle": np.deg2rad(100.0)},
     )
 
 
@@ -229,12 +251,12 @@ class EventsCfg:
             "y": (-0.5, 0.5),
         }},
     )
-    # 随机关节初始化
+    # 随机关节初始化（减小随机范围，先学站稳）
     reset_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
-            "position_range": (-0.1, 0.1),
+            "position_range": (-0.02, 0.02),  # 大幅减小
             "velocity_range": (-0.0, 0.0),
         },
     )
@@ -290,34 +312,62 @@ class X2WalkEnvCfg(ManagerBasedRLEnvCfg):
             init_state=ArticulationCfg.InitialStateCfg(
                 pos=(0.0, 0.0, 0.95),
                 joint_pos={
+                    # 腿部
                     "left_hip_pitch_joint":   -0.15,
                     "right_hip_pitch_joint":  -0.15,
                     "left_knee_joint":         0.35,
                     "right_knee_joint":        0.35,
                     "left_ankle_pitch_joint": -0.20,
                     "right_ankle_pitch_joint":-0.20,
+                    # 上半身（自然站立姿态）
+                    "waist_yaw_joint": 0.0,
+                    "waist_pitch_joint": 0.0,
+                    "waist_roll_joint": 0.0,
+                    "left_shoulder_pitch_joint": 0.0,
+                    "left_shoulder_roll_joint": 0.0,
+                    "left_shoulder_yaw_joint": 0.0,
+                    "left_elbow_joint": 0.0,
+                    "right_shoulder_pitch_joint": 0.0,
+                    "right_shoulder_roll_joint": 0.0,
+                    "right_shoulder_yaw_joint": 0.0,
+                    "right_elbow_joint": 0.0,
                 },
             ),
             actuators={
                 "hip_pitch": ImplicitActuatorCfg(
                     joint_names_expr=[".*_hip_pitch_joint"],
-                    stiffness=200.0, damping=5.0,
+                    stiffness=600.0, damping=5.0,
                     effort_limit=150.0,
                 ),
                 "hip_roll_yaw": ImplicitActuatorCfg(
                     joint_names_expr=[".*_hip_roll_joint", ".*_hip_yaw_joint"],
-                    stiffness=150.0, damping=5.0,
+                    stiffness=450.0, damping=5.0,
                     effort_limit=100.0,
                 ),
                 "knee": ImplicitActuatorCfg(
                     joint_names_expr=[".*_knee_joint"],
-                    stiffness=200.0, damping=5.0,
+                    stiffness=400.0, damping=5.0,
                     effort_limit=200.0,
                 ),
                 "ankle": ImplicitActuatorCfg(
                     joint_names_expr=[".*_ankle_.*_joint"],
-                    stiffness=40.0, damping=2.0,
+                    stiffness=200.0, damping=2.0,
                     effort_limit=40.0,
+                ),
+                "waist": ImplicitActuatorCfg(
+                    joint_names_expr=[".*waist.*"],
+                    stiffness=500.0, damping=10.0,
+                    effort_limit=150.0,
+                ),
+                "shoulder": ImplicitActuatorCfg(
+                    joint_names_expr=[".*shoulder.*"],
+                    stiffness=300.0, damping=5.0,
+                    effort_limit=80.0,
+                ),
+                "elbow": ImplicitActuatorCfg(
+                    joint_names_expr=[".*elbow.*"],
+                    stiffness=200.0, damping=3.0,
+                    effort_limit=50.0,
                 ),
             },
         )
